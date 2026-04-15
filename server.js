@@ -1,21 +1,35 @@
 const express = require('express');
-const fs = require('fs');
 const path = require('path');
+const { Pool } = require('pg');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const RSVP_FILE = path.join(__dirname, 'rsvps.json');
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Initialize RSVP file if it doesn't exist
-if (!fs.existsSync(RSVP_FILE)) {
-  fs.writeFileSync(RSVP_FILE, JSON.stringify([], null, 2));
+// ── PostgreSQL Setup ────────────────────────────────────
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
+});
+
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS rsvps (
+      id SERIAL PRIMARY KEY,
+      name VARCHAR(100) NOT NULL,
+      attendance VARCHAR(20) NOT NULL,
+      guests INTEGER NOT NULL DEFAULT 2,
+      message TEXT DEFAULT '',
+      submitted_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  console.log('  ✅ Database ready');
 }
 
-// POST - Save RSVP
-app.post('/api/rsvp', (req, res) => {
+// ── POST - Save RSVP ───────────────────────────────────
+app.post('/api/rsvp', async (req, res) => {
   const { name, attendance, guests, message } = req.body;
 
   if (!name || typeof name !== 'string' || name.trim().length === 0) {
@@ -32,19 +46,11 @@ app.post('/api/rsvp', (req, res) => {
 
   const sanitize = (str) => str.replace(/[<>&"'/]/g, '');
 
-  const rsvpEntry = {
-    id: Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
-    name: sanitize(name.trim().slice(0, 100)),
-    attendance,
-    guests: guestCount,
-    message: message ? sanitize(message.trim().slice(0, 500)) : '',
-    submittedAt: new Date().toISOString()
-  };
-
   try {
-    const data = JSON.parse(fs.readFileSync(RSVP_FILE, 'utf-8'));
-    data.push(rsvpEntry);
-    fs.writeFileSync(RSVP_FILE, JSON.stringify(data, null, 2));
+    await pool.query(
+      'INSERT INTO rsvps (name, attendance, guests, message) VALUES ($1, $2, $3, $4)',
+      [sanitize(name.trim().slice(0, 100)), attendance, guestCount, message ? sanitize(message.trim().slice(0, 500)) : '']
+    );
     res.json({ success: true, message: 'RSVP saved successfully!' });
   } catch (err) {
     console.error('Error saving RSVP:', err);
@@ -52,16 +58,25 @@ app.post('/api/rsvp', (req, res) => {
   }
 });
 
-// GET - Retrieve RSVPs (optional admin view)
-app.get('/api/rsvps', (req, res) => {
+// ── GET - Retrieve RSVPs ────────────────────────────────
+app.get('/api/rsvps', async (req, res) => {
   try {
-    const data = JSON.parse(fs.readFileSync(RSVP_FILE, 'utf-8'));
-    res.json(data);
+    const result = await pool.query(
+      'SELECT name, attendance, guests, message, submitted_at AS "submittedAt" FROM rsvps ORDER BY submitted_at DESC'
+    );
+    res.json(result.rows);
   } catch (err) {
+    console.error('Error reading RSVPs:', err);
     res.status(500).json({ error: 'Failed to read RSVPs.' });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`\n  🏠 Housewarming site running at http://localhost:${PORT}\n`);
+// ── Start ───────────────────────────────────────────────
+initDB().then(() => {
+  app.listen(PORT, () => {
+    console.log(`\n  🏠 Housewarming site running at http://localhost:${PORT}\n`);
+  });
+}).catch(err => {
+  console.error('Failed to initialize database:', err);
+  process.exit(1);
 });
