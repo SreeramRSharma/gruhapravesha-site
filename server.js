@@ -1,32 +1,47 @@
 const express = require('express');
+const fs = require('fs');
 const path = require('path');
-const { Pool } = require('pg');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const USE_DB = !!process.env.DATABASE_URL;
+const RSVP_FILE = path.join(__dirname, 'rsvps.json');
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ── PostgreSQL Setup ────────────────────────────────────
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
-});
+// ── PostgreSQL Setup (production) ───────────────────────
+let pool;
+if (USE_DB) {
+  const { Pool } = require('pg');
+  pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false }
+  });
+}
 
 async function initDB() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS rsvps (
-      id SERIAL PRIMARY KEY,
-      name VARCHAR(100) NOT NULL,
-      attendance VARCHAR(20) NOT NULL,
-      guests INTEGER NOT NULL DEFAULT 2,
-      message TEXT DEFAULT '',
-      submitted_at TIMESTAMPTZ DEFAULT NOW()
-    )
-  `);
-  console.log('  ✅ Database ready');
+  if (USE_DB) {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS rsvps (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        attendance VARCHAR(20) NOT NULL,
+        guests INTEGER NOT NULL DEFAULT 2,
+        message TEXT DEFAULT '',
+        submitted_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    console.log('  ✅ PostgreSQL database ready');
+  } else {
+    if (!fs.existsSync(RSVP_FILE)) {
+      fs.writeFileSync(RSVP_FILE, JSON.stringify([], null, 2));
+    }
+    console.log('  📁 Using local file storage (rsvps.json)');
+  }
 }
+
+const sanitize = (str) => str.replace(/[<>&"'/]/g, '');
 
 // ── POST - Save RSVP ───────────────────────────────────
 app.post('/api/rsvp', async (req, res) => {
@@ -44,13 +59,20 @@ app.post('/api/rsvp', async (req, res) => {
     return res.status(400).json({ error: 'Number of guests must be between 1 and 20.' });
   }
 
-  const sanitize = (str) => str.replace(/[<>&"'/]/g, '');
+  const cleanName = sanitize(name.trim().slice(0, 100));
+  const cleanMsg = message ? sanitize(message.trim().slice(0, 500)) : '';
 
   try {
-    await pool.query(
-      'INSERT INTO rsvps (name, attendance, guests, message) VALUES ($1, $2, $3, $4)',
-      [sanitize(name.trim().slice(0, 100)), attendance, guestCount, message ? sanitize(message.trim().slice(0, 500)) : '']
-    );
+    if (USE_DB) {
+      await pool.query(
+        'INSERT INTO rsvps (name, attendance, guests, message) VALUES ($1, $2, $3, $4)',
+        [cleanName, attendance, guestCount, cleanMsg]
+      );
+    } else {
+      const data = JSON.parse(fs.readFileSync(RSVP_FILE, 'utf-8'));
+      data.push({ name: cleanName, attendance, guests: guestCount, message: cleanMsg, submittedAt: new Date().toISOString() });
+      fs.writeFileSync(RSVP_FILE, JSON.stringify(data, null, 2));
+    }
     res.json({ success: true, message: 'RSVP saved successfully!' });
   } catch (err) {
     console.error('Error saving RSVP:', err);
@@ -61,10 +83,15 @@ app.post('/api/rsvp', async (req, res) => {
 // ── GET - Retrieve RSVPs ────────────────────────────────
 app.get('/api/rsvps', async (req, res) => {
   try {
-    const result = await pool.query(
-      'SELECT name, attendance, guests, message, submitted_at AS "submittedAt" FROM rsvps ORDER BY submitted_at DESC'
-    );
-    res.json(result.rows);
+    if (USE_DB) {
+      const result = await pool.query(
+        'SELECT name, attendance, guests, message, submitted_at AS "submittedAt" FROM rsvps ORDER BY submitted_at DESC'
+      );
+      res.json(result.rows);
+    } else {
+      const data = JSON.parse(fs.readFileSync(RSVP_FILE, 'utf-8'));
+      res.json(data);
+    }
   } catch (err) {
     console.error('Error reading RSVPs:', err);
     res.status(500).json({ error: 'Failed to read RSVPs.' });
